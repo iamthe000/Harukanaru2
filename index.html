@@ -26,20 +26,12 @@
 
         .guide { position: absolute; top: 20px; left: 20px; color: rgba(255,255,255,0.7); text-shadow: 1px 1px 2px black; pointer-events: none; }
     </style>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/nipplejs/0.10.1/nipplejs.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/simplex-noise@3.0.0/dist/simplex-noise.js"></script>
 </head>
 <body>
 
 <div id="loading">Loading Nature Assets...</div>
 
-<div id="ui-layer">
-    <div class="guide">
-        <p>PC: WASD移動 / マウスドラッグ視点</p>
-        <p>SP: 左下ジョイスティック / 右画面ドラッグ視点</p>
-    </div>
-    <div id="zone_joystick"></div>
-    <div id="zone_look"></div>
-</div>
 
 <script type="importmap">
     {
@@ -66,11 +58,14 @@
     // グローバル変数
     let scene, camera, renderer, clock;
     let playerObj; // プレイヤーの体（カメラの親）
+    let ground; // 地形メッシュ
     const mixers = []; // アニメーション用（今回は未使用だが拡張用）
 
     // 入力状態
-    let moveForward = 0, moveRight = 0; // -1 to 1
-    let lookVelocity = { x: 0, y: 0 };
+    const touchState = {
+        move: { id: -1, x: 0, y: 0, dx: 0, dy: 0 },
+        look: { id: -1, x: 0, y: 0, dx: 0, dy: 0 }
+    };
     
     init();
 
@@ -99,7 +94,21 @@
 
         clock = new THREE.Clock();
 
-        // 3. アセット読み込み開始
+        // 3. 水面を追加
+        const waterGeometry = new THREE.PlaneGeometry(CONFIG.worldSize, CONFIG.worldSize);
+        const waterMaterial = new THREE.MeshStandardMaterial({
+            color: 0x006994,
+            transparent: true,
+            opacity: 0.7,
+            roughness: 0.1,
+            metalness: 0.8
+        });
+        const water = new THREE.Mesh(waterGeometry, waterMaterial);
+        water.rotation.x = -Math.PI / 2;
+        water.position.y = 0; // 水位
+        scene.add(water);
+
+        // 4. アセット読み込み開始
         loadEnvironment();
         loadTerrain();
         loadAssets(); // 木など
@@ -135,37 +144,65 @@
 
     // --- 地形 ---
     function loadTerrain() {
-        const textureLoader = new THREE.TextureLoader();
+        const simplex = new SimplexNoise();
+        const geometry = new THREE.PlaneGeometry(CONFIG.worldSize, CONFIG.worldSize, 256, 256);
         
-        // リアルな地面テクスチャ (AmbientCG)
-        const loadTex = (url) => {
-            const t = textureLoader.load(url);
-            t.wrapS = t.wrapT = THREE.RepeatWrapping;
-            t.repeat.set(20, 20); // 繰り返し回数
-            return t;
+        // 頂点の高さを計算し、色を割り当てる
+        const vertices = geometry.attributes.position;
+        const colors = [];
+        const color = new THREE.Color();
+
+        // バイオームのカラーストップ
+        const biomeColors = {
+            sand: new THREE.Color(0xc2b280),
+            grass: new THREE.Color(0x559020),
+            rock: new THREE.Color(0x808080),
+            snow: new THREE.Color(0xffffff)
         };
 
-        const colorMap = loadTex('https://raw.githubusercontent.com/mrdoob/three.js/master/examples/textures/terrain/grasslight-big.jpg');
+        for (let i = 0; i < vertices.count; i++) {
+            const x = vertices.getX(i);
+            const y = vertices.getY(i);
+
+            // Simplex Noise を使って自然な地形を生成
+            const noise1 = simplex.noise2D(x / 150, y / 150) * 10;
+            const noise2 = simplex.noise2D(x / 40, y / 40) * 3;
+            const noise3 = simplex.noise2D(x / 10, y / 10) * 1;
+            const height = noise1 + noise2 + noise3;
+            vertices.setZ(i, height);
+
+            // 高さに基づいて色を決定
+            if (height < 1) {
+                color.copy(biomeColors.sand);
+            } else if (height < 5) {
+                // 砂と草を滑らかに混ぜる
+                const factor = (height - 1) / (5 - 1);
+                color.copy(biomeColors.sand).lerp(biomeColors.grass, factor);
+            } else if (height < 10) {
+                 // 草と岩を滑らかに混ぜる
+                const factor = (height - 5) / (10 - 5);
+                color.copy(biomeColors.grass).lerp(biomeColors.rock, factor);
+            } else if (height < 13) {
+                // 岩と雪を滑らかに混ぜる
+                const factor = (height - 10) / (13 - 10);
+                color.copy(biomeColors.rock).lerp(biomeColors.snow, factor);
+            } else {
+                color.copy(biomeColors.snow);
+            }
+            colors.push(color.r, color.g, color.b);
+        }
+        geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
         
-        const geometry = new THREE.PlaneGeometry(CONFIG.worldSize, CONFIG.worldSize, 64, 64);
-        const material = new THREE.MeshStandardMaterial({ 
-            map: colorMap,
-            roughness: 0.8,
+        geometry.computeVertexNormals(); // 法線を再計算して、光の当たり方を正しくする
+
+        // テクスチャではなく、頂点の色で地形を表現する
+        const material = new THREE.MeshStandardMaterial({
+            vertexColors: true, 
+            roughness: 0.9,
             metalness: 0.1
         });
 
-        // 簡易的な起伏を作る
-        const count = geometry.attributes.position.count;
-        for (let i = 0; i < count; i++) {
-            const x = geometry.attributes.position.getX(i);
-            const y = geometry.attributes.position.getY(i);
-            // 波を使って丘を作る
-            const height = Math.sin(x * 0.1) * Math.cos(y * 0.1) * 2 + Math.random() * 0.5;
-            geometry.attributes.position.setZ(i, height); // Planeは最初縦向きなのでZが高さになる
-        }
-        geometry.computeVertexNormals();
-
-        const ground = new THREE.Mesh(geometry, material);
+        ground = new THREE.Mesh(geometry, material);
         ground.rotation.x = -Math.PI / 2;
         ground.receiveShadow = true;
         scene.add(ground);
@@ -174,42 +211,49 @@
     // --- 外部モデル（木） ---
     function loadAssets() {
         const loader = new GLTFLoader();
-        
-        // 外部のフリー3Dモデル（ローポリの木）
-        // 注意: 外部URLは変更される可能性があります。その場合は別のURLに差し替えてください。
-        // ここではThree.jsのExampleでも使われるような軽量モデルを使用するか、プリミティブで代用するロジックを組みます。
-        
-        // 今回は確実性を重視し、Three.js Examplesにある「木」のモデルを使用
-        loader.load('https://raw.githubusercontent.com/mrdoob/three.js/master/examples/models/gltf/SimpleTree.glb', (gltf) => {
+        const raycaster = new THREE.Raycaster();
+        const origin = new THREE.Vector3(0, 50, 0); // レイの開始点 (十分高い位置)
+        const direction = new THREE.Vector3(0, -1, 0); // レイの方向 (真下)
+
+        loader.load('https://raw.githubusercontent.com/discoverthreejs/discover-threejs-book/master/public/models/low_poly_tree.glb', (gltf) => {
             const treeModel = gltf.scene;
-            
-            // 木をランダムに配置
-            for (let i = 0; i < CONFIG.treeCount; i++) {
-                const tree = treeModel.clone();
-                const s = 1.5 + Math.random() * 2;
-                tree.scale.set(s, s, s);
-                
-                const x = (Math.random() - 0.5) * CONFIG.worldSize * 0.8;
-                const z = (Math.random() - 0.5) * CONFIG.worldSize * 0.8;
-                
-                // 地形の高さに合わせる簡易計算（本来はRaycasterを使うが軽量化のため近似）
-                const y = Math.sin(x * 0.1) * Math.cos(z * 0.1) * 2;
-                
-                tree.position.set(x, y, z);
-                tree.traverse((c) => { 
-                    if(c.isMesh) {
-                        c.castShadow = true; 
-                        c.receiveShadow = true;
+            treeModel.traverse((c) => {
+                if (c.isMesh) {
+                    c.castShadow = true;
+                }
+            });
+
+            let treesPlaced = 0;
+            while (treesPlaced < CONFIG.treeCount) {
+                const x = (Math.random() - 0.5) * CONFIG.worldSize;
+                const z = (Math.random() - 0.5) * CONFIG.worldSize;
+                origin.set(x, 50, z);
+                raycaster.set(origin, direction);
+
+                const intersects = raycaster.intersectObject(ground);
+
+                if (intersects.length > 0) {
+                    const hit = intersects[0];
+                    const y = hit.point.y;
+                    const normal = hit.face.normal;
+
+                    // 水中(y<0)や急な崖(法線のy成分が小さい)には配置しない
+                    if (y > 0.5 && normal.y > 0.9) {
+                        const tree = treeModel.clone();
+                        const s = 1.5 + Math.random() * 2;
+                        tree.scale.set(s, s, s);
+                        tree.position.set(x, y, z);
+                        tree.rotation.y = Math.random() * Math.PI * 2;
+                        scene.add(tree);
+                        treesPlaced++;
                     }
-                });
-                scene.add(tree);
+                }
             }
-            document.getElementById('loading').style.opacity = 0;
+            document.getElementById('loading').style.display = 'none';
         }, undefined, (error) => {
             console.error('Model load error, using fallback:', error);
-            // モデル読み込み失敗時は緑の円柱を表示（フォールバック）
             createFallbackTrees();
-            document.getElementById('loading').style.opacity = 0;
+            document.getElementById('loading').style.display = 'none';
         });
     }
 
@@ -223,79 +267,59 @@
         }
     }
 
-    // --- 操作系 (nipple.js + Touch) ---
+    // --- 操作系 (タッチのみ) ---
     function setupControls() {
-        // 1. ジョイスティック (nipple.js)
-        const joystickManager = nipplejs.create({
-            zone: document.getElementById('zone_joystick'),
-            mode: 'static',
-            position: { left: '50%', top: '50%' },
-            color: 'white'
-        });
+        renderer.domElement.addEventListener('touchstart', handleTouchStart);
+        renderer.domElement.addEventListener('touchmove', handleTouchMove);
+        renderer.domElement.addEventListener('touchend', handleTouchEnd);
+        renderer.domElement.addEventListener('touchcancel', handleTouchEnd);
+    }
 
-        joystickManager.on('move', (evt, data) => {
-            const forward = data.vector.y;
-            const right = data.vector.x;
-            moveForward = forward;
-            moveRight = right;
-        });
-
-        joystickManager.on('end', () => {
-            moveForward = 0;
-            moveRight = 0;
-        });
-
-        // 2. 視点移動 (タッチドラッグ)
-        const lookZone = document.getElementById('zone_look');
-        let lastTouchX = 0;
-        let lastTouchY = 0;
-
-        lookZone.addEventListener('touchstart', (e) => {
-            lastTouchX = e.touches[0].clientX;
-            lastTouchY = e.touches[0].clientY;
-        }, {passive: false});
-
-        lookZone.addEventListener('touchmove', (e) => {
-            e.preventDefault(); // スクロール防止
-            const touchX = e.touches[0].clientX;
-            const touchY = e.touches[0].clientY;
-            
-            const deltaX = touchX - lastTouchX;
-            const deltaY = touchY - lastTouchY;
-
-            playerObj.rotation.y -= deltaX * CONFIG.turnSpeed * 2;
-            camera.rotation.x -= deltaY * CONFIG.turnSpeed * 1;
-            
-            // 上下の首振りを制限
-            camera.rotation.x = Math.max(-Math.PI/3, Math.min(Math.PI/3, camera.rotation.x));
-
-            lastTouchX = touchX;
-            lastTouchY = touchY;
-        }, {passive: false});
-
-        // 3. PC用キーボード & マウス操作
-        document.addEventListener('keydown', (e) => {
-            if (e.code === 'KeyW') moveForward = 1;
-            if (e.code === 'KeyS') moveForward = -1;
-            if (e.code === 'KeyA') moveRight = -1;
-            if (e.code === 'KeyD') moveRight = 1;
-        });
-        document.addEventListener('keyup', (e) => {
-            if (['KeyW', 'KeyS'].includes(e.code)) moveForward = 0;
-            if (['KeyA', 'KeyD'].includes(e.code)) moveRight = 0;
-        });
-        
-        // PCのマウスドラッグ視点移動（簡易）
-        let isMouseDown = false;
-        document.addEventListener('mousedown', () => isMouseDown = true);
-        document.addEventListener('mouseup', () => isMouseDown = false);
-        document.addEventListener('mousemove', (e) => {
-            if(isMouseDown) {
-                playerObj.rotation.y -= e.movementX * CONFIG.turnSpeed;
-                camera.rotation.x -= e.movementY * CONFIG.turnSpeed;
-                camera.rotation.x = Math.max(-Math.PI/3, Math.min(Math.PI/3, camera.rotation.x));
+    function handleTouchStart(e) {
+        e.preventDefault();
+        for (const touch of e.changedTouches) {
+            if (touch.clientX < window.innerWidth / 2 && touchState.move.id === -1) {
+                // 左半分: 移動
+                touchState.move.id = touch.identifier;
+                touchState.move.x = touch.clientX;
+                touchState.move.y = touch.clientY;
+            } else if (touch.clientX >= window.innerWidth / 2 && touchState.look.id === -1) {
+                // 右半分: 視点
+                touchState.look.id = touch.identifier;
+                touchState.look.x = touch.clientX;
+                touchState.look.y = touch.clientY;
             }
-        });
+        }
+    }
+
+    function handleTouchMove(e) {
+        e.preventDefault();
+        for (const touch of e.changedTouches) {
+            if (touch.identifier === touchState.move.id) {
+                touchState.move.dx = (touch.clientX - touchState.move.x) / 50;
+                touchState.move.dy = (touch.clientY - touchState.move.y) / 50;
+            } else if (touch.identifier === touchState.look.id) {
+                touchState.look.dx = (touch.clientX - touchState.look.x) * 0.1;
+                touchState.look.dy = (touch.clientY - touchState.look.y) * 0.1;
+                touchState.look.x = touch.clientX;
+                touchState.look.y = touch.clientY;
+            }
+        }
+    }
+
+    function handleTouchEnd(e) {
+        e.preventDefault();
+        for (const touch of e.changedTouches) {
+            if (touch.identifier === touchState.move.id) {
+                touchState.move.id = -1;
+                touchState.move.dx = 0;
+                touchState.move.dy = 0;
+            } else if (touch.identifier === touchState.look.id) {
+                touchState.look.id = -1;
+                touchState.look.dx = 0;
+                touchState.look.dy = 0;
+            }
+        }
     }
 
     // --- メインループ ---
@@ -304,28 +328,40 @@
         
         const delta = clock.getDelta();
         
-        // 移動処理
-        if (moveForward !== 0 || moveRight !== 0) {
-            const direction = new THREE.Vector3();
-            
-            // カメラの向いている方向を取得 (Y軸回転のみ考慮)
-            const forward = new THREE.Vector3(0, 0, -1).applyAxisAngle(new THREE.Vector3(0, 1, 0), playerObj.rotation.y);
-            const right = new THREE.Vector3(1, 0, 0).applyAxisAngle(new THREE.Vector3(0, 1, 0), playerObj.rotation.y);
+        // --- 視点更新 ---
+        if (touchState.look.id !== -1) {
+            playerObj.rotation.y -= touchState.look.dx * CONFIG.turnSpeed;
+            camera.rotation.x -= touchState.look.dy * CONFIG.turnSpeed;
+            camera.rotation.x = Math.max(-Math.PI / 3, Math.min(Math.PI / 3, camera.rotation.x));
+            // dx, dyは消費したのでリセット
+            touchState.look.dx = 0;
+            touchState.look.dy = 0;
+        }
 
-            // 入力に合わせてベクトル合成
+        // --- 移動更新 ---
+        const moveForward = -touchState.move.dy;
+        const moveRight = touchState.move.dx;
+
+        if (Math.abs(moveForward) > 0.1 || Math.abs(moveRight) > 0.1) {
+            const direction = new THREE.Vector3();
+            const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(playerObj.quaternion);
+            const right = new THREE.Vector3(1, 0, 0).applyQuaternion(playerObj.quaternion);
+            
             direction.addScaledVector(forward, moveForward);
             direction.addScaledVector(right, moveRight);
             direction.normalize();
 
             playerObj.position.addScaledVector(direction, CONFIG.speed * delta);
+        }
 
-            // 簡易地形当たり判定（地面の高さを計算してY座標を合わせる）
-            const x = playerObj.position.x;
-            const z = playerObj.position.z;
-            const groundHeight = Math.sin(x * 0.1) * Math.cos(z * 0.1) * 2; // 地形生成と同じ計算式
-            
-            // 地面より少し上にプレイヤーを配置 (少しスムーズに)
-            playerObj.position.y = THREE.MathUtils.lerp(playerObj.position.y, groundHeight, 0.1);
+        // --- 地形当たり判定 ---
+        const raycaster = new THREE.Raycaster(playerObj.position.clone().setY(50), new THREE.Vector3(0, -1, 0));
+        const intersects = raycaster.intersectObject(ground);
+        if (intersects.length > 0) {
+            const groundHeight = intersects[0].point.y;
+            const targetY = groundHeight + 1.7; // 目の高さ
+            // スムーズにY座標を更新
+            playerObj.position.y = THREE.MathUtils.lerp(playerObj.position.y, targetY, 0.2);
         }
 
         renderer.render(scene, camera);
