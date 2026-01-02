@@ -31,13 +31,15 @@
 <script type="importmap">
     {
         "imports": {
-            "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
         }
     }
 </script>
 
 <script type="module">
     import * as THREE from 'three';
+    import { Sky } from 'three/addons/objects/Sky.js';
 
     // --- 設定 ---
     const CONFIG = {
@@ -98,7 +100,7 @@
     function init() {
         scene = new THREE.Scene();
         // フォグの設定（遠くの山を霞ませる）
-        scene.fog = new THREE.FogExp2(0x87CEEB, 0.0015);
+        scene.fog = new THREE.FogExp2(0x94b5c0, 0.0015);
 
         camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 2000);
         playerObj = new THREE.Group();
@@ -111,31 +113,50 @@
         renderer.setSize(window.innerWidth, window.innerHeight);
         renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
         renderer.toneMapping = THREE.ACESFilmicToneMapping; // リアルな色調
-        renderer.toneMappingExposure = 1.0;
+        renderer.toneMappingExposure = 0.6;
         document.body.appendChild(renderer.domElement);
 
         clock = new THREE.Clock();
+        
+        // --- Sky ---
+        const sky = new Sky();
+        sky.scale.setScalar(450000);
+        scene.add(sky);
 
+        const sun = new THREE.Vector3();
+
+        const effectController = {
+            turbidity: 10,
+            rayleigh: 2,
+            mieCoefficient: 0.005,
+            mieDirectionalG: 0.8,
+            elevation: 10, // 太陽の高さ
+            azimuth: 180,  // 太陽の方角
+        };
+        
+        const uniforms = sky.material.uniforms;
+        uniforms['turbidity'].value = effectController.turbidity;
+        uniforms['rayleigh'].value = effectController.rayleigh;
+        uniforms['mieCoefficient'].value = effectController.mieCoefficient;
+        uniforms['mieDirectionalG'].value = effectController.mieDirectionalG;
+
+        const phi = THREE.MathUtils.degToRad(90 - effectController.elevation);
+        const theta = THREE.MathUtils.degToRad(effectController.azimuth);
+
+        sun.setFromSphericalCoords(1, phi, theta);
+        uniforms['sunPosition'].value.copy(sun);
+        
         // --- ライティング ---
-        const sun = new THREE.DirectionalLight(0xffffff, 1.5);
-        sun.position.set(100, 200, 100);
-        sun.castShadow = false; // パフォーマンス優先
-        scene.add(sun);
+        const sunLight = new THREE.DirectionalLight(0xffffff, 3);
+        sunLight.position.set(sun.x, sun.y, sun.z);
+        sunLight.castShadow = false; // パフォーマンス優先
+        scene.add(sunLight);
         scene.add(new THREE.AmbientLight(0x404040, 1.0)); // 環境光強め
 
         // --- 外部アセットの読み込み ---
         const loader = new THREE.TextureLoader(loadingManager);
 
-        // 1. 綺麗な空 (Equirectangular Panorama)
-        // Three.jsの公式サンプルまたは安定したCDNから取得
-        loader.load('https://dl.polyhaven.org/file/ph-assets/HDRIs/extra/Tonemapped%20JPG/citrus_orchard_road_puresky.jpg', (texture) => {
-            texture.mapping = THREE.EquirectangularReflectionMapping;
-            texture.colorSpace = THREE.SRGBColorSpace;
-            scene.background = texture;
-            scene.environment = texture; // 環境マップとして反射にも使用
-        });
-
-        // 2. 岩肌のテクスチャ (地形用)
+        // 岩肌のテクスチャ (地形用)
         // 汎用的な岩/地面のテクスチャ
         loader.load('https://raw.githubusercontent.com/mrdoob/three.js/master/examples/textures/terrain/grasslight-big.jpg', (texture) => {
             texture.wrapS = THREE.RepeatWrapping;
