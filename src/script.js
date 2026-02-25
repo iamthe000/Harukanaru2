@@ -1,0 +1,318 @@
+import * as THREE from 'three';
+import { Sky } from 'three/addons/objects/Sky.js';
+
+// --- 設定 ---
+const CONFIG = {
+    speed: 15.0,
+    turnSpeed: 0.0025,
+    worldSize: 1000,     // 世界を広く
+    waterLevel: 2,       // 水面高さ
+    textureRepeat: 20    // 岩肌テクスチャの繰り返し回数
+};
+
+// --- ノイズ関数 (Perlin-like) ---
+const p = new Uint8Array(512);
+for(let i=0; i<256; i++) p[i] = p[i+256] = Math.floor(Math.random()*256);
+const lerp = (a, b, t) => a + (b - a) * t;
+const fade = t => t * t * t * (t * (t * 6 - 15) + 10);
+const grad = (hash, x, y) => {
+    const h = hash & 15;
+    return ((h & 8) ? -x : x) + ((h & 4) ? -y : y);
+};
+function noise(x, y) {
+    let X = Math.floor(x) & 255, Y = Math.floor(y) & 255;
+    x -= Math.floor(x); y -= Math.floor(y);
+    let u = fade(x), v = fade(y);
+    const A = p[X]+Y, B = p[X+1]+Y;
+    return lerp(lerp(grad(p[A], x, y), grad(p[B], x-1, y), u),
+                lerp(grad(p[A+1], x, y-1), grad(p[B+1], x-1, y-1), u), v);
+}
+
+// フラクタルノイズ（オクターブ合成）でより自然な地形を作る
+function fbm(x, y, octaves) {
+    let val = 0;
+    let amp = 1;
+    let freq = 1;
+    let max = 0;
+    for(let i=0; i<octaves; i++) {
+        val += noise(x * freq, y * freq) * amp;
+        max += amp;
+        amp *= 0.5;
+        freq *= 2;
+    }
+    return val; // 正規化せずにそのまま返す（調整しやすくするため）
+}
+
+let scene, camera, renderer, clock, playerObj, ground;
+const touchState = { move: { id: -1, x: 0, y: 0, dx: 0, dy: 0 }, look: { id: -1, x: 0, y: 0, dx: 0, dy: 0 } };
+const loadingManager = new THREE.LoadingManager();
+
+loadingManager.onLoad = () => {
+    const el = document.getElementById('loading');
+    if(el) { 
+        el.style.opacity = '0'; 
+        setTimeout(() => el.style.display = 'none', 800); 
+    }
+};
+
+init();
+
+function init() {
+    scene = new THREE.Scene();
+    // フォグの設定（遠くの山を霞ませる）
+    scene.fog = new THREE.FogExp2(0x94b5c0, 0.0015);
+
+    camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 2000);
+    playerObj = new THREE.Group();
+    playerObj.position.set(0, 50, 0); 
+    playerObj.add(camera);
+    camera.position.set(0, 1.7, 0); 
+    scene.add(playerObj);
+
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+    renderer.toneMapping = THREE.ACESFilmicToneMapping; // リアルな色調
+    renderer.toneMappingExposure = 0.6;
+    document.body.appendChild(renderer.domElement);
+
+    clock = new THREE.Clock();
+    
+    // --- Sky ---
+    const sky = new Sky();
+    sky.scale.setScalar(450000);
+    scene.add(sky);
+
+    const sun = new THREE.Vector3();
+
+    const effectController = {
+        turbidity: 10,
+        rayleigh: 2,
+        mieCoefficient: 0.005,
+        mieDirectionalG: 0.8,
+        elevation: 10, // 太陽の高さ
+        azimuth: 180,  // 太陽の方角
+    };
+    
+    const uniforms = sky.material.uniforms;
+    uniforms['turbidity'].value = effectController.turbidity;
+    uniforms['rayleigh'].value = effectController.rayleigh;
+    uniforms['mieCoefficient'].value = effectController.mieCoefficient;
+    uniforms['mieDirectionalG'].value = effectController.mieDirectionalG;
+
+    const phi = THREE.MathUtils.degToRad(90 - effectController.elevation);
+    const theta = THREE.MathUtils.degToRad(effectController.azimuth);
+
+    sun.setFromSphericalCoords(1, phi, theta);
+    uniforms['sunPosition'].value.copy(sun);
+    
+    // --- ライティング ---
+    const sunLight = new THREE.DirectionalLight(0xffffff, 3);
+    sunLight.position.set(sun.x, sun.y, sun.z);
+    sunLight.castShadow = false; // パフォーマンス優先
+    scene.add(sunLight);
+    scene.add(new THREE.AmbientLight(0x404040, 1.0)); // 環境光強め
+
+    // --- 外部アセットの読み込み ---
+    const loader = new THREE.TextureLoader(loadingManager);
+
+    // 岩肌のテクスチャ (地形用)
+    // 汎用的な岩/地面のテクスチャ
+    loader.load('https://raw.githubusercontent.com/mrdoob/three.js/master/examples/textures/terrain/grasslight-big.jpg', (texture) => {
+        texture.wrapS = THREE.RepeatWrapping;
+        texture.wrapT = THREE.RepeatWrapping;
+        texture.repeat.set(CONFIG.textureRepeat, CONFIG.textureRepeat);
+        texture.colorSpace = THREE.SRGBColorSpace;
+        generateLandscape(texture);
+    });
+    
+    // 水面
+    createWater();
+    
+    setupControls();
+    animate();
+}
+
+function createWater() {
+    const waterGeo = new THREE.PlaneGeometry(CONFIG.worldSize * 3, CONFIG.worldSize * 3);
+    const waterMat = new THREE.MeshStandardMaterial({ 
+        color: 0x0077be, 
+        transparent: true, 
+        opacity: 0.7, 
+        roughness: 0.1,
+        metalness: 0.8
+    });
+    const water = new THREE.Mesh(waterGeo, waterMat);
+    water.rotation.x = -Math.PI / 2;
+    water.position.y = CONFIG.waterLevel;
+    scene.add(water);
+}
+
+function generateLandscape(detailTexture) {
+    const segs = 256; // 解像度アップ
+    const geo = new THREE.PlaneGeometry(CONFIG.worldSize, CONFIG.worldSize, segs, segs);
+    const pos = geo.attributes.position;
+    const colors = [];
+    const count = pos.count;
+
+    for (let i = 0; i < count; i++) {
+        const x = pos.getX(i);
+        const y = pos.getY(i); // PlaneGeometryなのでZではなくYが平面座標
+
+        // --- 地形生成ロジック (高・中・低) ---
+        
+        // 1. 低い山・平野 (Low/Base)
+        // 大きなうねり。あまり高くしない。
+        let h = fbm(x * 0.003, y * 0.003, 2) * 15; 
+
+        // 2. 高い山 (High Mountains)
+        // 特定のエリアだけ隆起させるためのマスクを作成
+        // ノイズ値が0.5以上の場所だけをグンと高くする
+        let mountainMask = noise(x * 0.0015 + 100, y * 0.0015 + 100); 
+        mountainMask = Math.max(0, (mountainMask - 0.2) * 2.5); // 0以下の値をカットしてコントラストを上げる
+
+        // 岩肌のような鋭いノイズ
+        let peaks = Math.abs(noise(x * 0.01, y * 0.01)); 
+        peaks *= peaks; // 尖らせる
+        
+        // マスクを適用して、高い山を加算 (最大高さ 120程度)
+        h += mountainMask * (peaks * 100 + 20);
+
+        // 3. 中くらいの起伏 (Detail)
+        h += noise(x * 0.05, y * 0.05) * 2;
+
+        // 水面より下は少し平らに
+        if (h < CONFIG.waterLevel) h = lerp(h, CONFIG.waterLevel - 2, 0.4);
+
+        pos.setZ(i, h);
+
+        // --- カラー設定 (テクスチャとブレンドされる) ---
+        let c = new THREE.Color();
+        
+        // 傾斜計算（簡易的）
+        // 隣接点との高さの差で傾斜を推測できるが、ここでは高さベースで色分けし、
+        // テクスチャが岩肌感を出すアプローチを取る
+        
+        if (h < CONFIG.waterLevel + 1.5) {
+            c.setHex(0xd2b48c); // 砂浜 (Tan)
+        } else if (h < 25) {
+            // 平野・低い丘 (緑)
+            c.setHex(0x558833);
+        } else if (h < 60) {
+            // 中腹 (岩と草の混合 - 暗めの緑茶色)
+            c.setHex(0x5a5a4a); 
+        } else if (h < 90) {
+            // 高い山 (岩肌 - グレー)
+            c.setHex(0x666666); 
+        } else {
+            // 山頂 (雪 - 白)
+            c.setHex(0xffffff);
+        }
+        colors.push(c.r, c.g, c.b);
+    }
+
+    geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+    geo.computeVertexNormals();
+
+    // --- マテリアル設定 ---
+    // 頂点カラー(vertexColors)とテクスチャ(map)を掛け合わせる
+    const mat = new THREE.MeshStandardMaterial({ 
+        map: detailTexture,       // 岩肌・地面の質感を付与
+        vertexColors: true,       // 高さごとの色分けを有効化
+        roughness: 0.9,
+        metalness: 0.1
+    });
+
+    ground = new THREE.Mesh(geo, mat);
+    ground.rotation.x = -Math.PI / 2;
+    scene.add(ground);
+    ground.updateMatrixWorld(); // 高さ判定のために即時更新
+    
+    // プレイヤーの初期位置を地面の上に合わせる
+    const startY = getH(0, 0);
+    playerObj.position.y = startY + 5;
+}
+
+function getH(x, z) {
+    if(!ground) return 0;
+    // Raycasterを使って正確な高さを取得
+    // パフォーマンスのため真上から下にRayを飛ばす
+    const ray = new THREE.Raycaster(new THREE.Vector3(x, 300, z), new THREE.Vector3(0,-1,0));
+    const hits = ray.intersectObject(ground);
+    return hits.length > 0 ? hits[0].point.y : 0;
+}
+
+function setupControls() {
+    const onTouchStart = (e) => {
+        for (const t of e.changedTouches) {
+            if (t.clientX < window.innerWidth / 2) {
+                touchState.move.id = t.identifier;
+                touchState.move.x = t.clientX; touchState.move.y = t.clientY;
+            } else {
+                touchState.look.id = t.identifier;
+                touchState.look.x = t.clientX; touchState.look.y = t.clientY;
+            }
+        }
+    };
+    const onTouchMove = (e) => {
+        e.preventDefault();
+        for (const t of e.changedTouches) {
+            if (t.identifier === touchState.move.id) {
+                touchState.move.dx = (t.clientX - touchState.move.x) / 30;
+                touchState.move.dy = (t.clientY - touchState.move.y) / 30;
+            } else if (t.identifier === touchState.look.id) {
+                touchState.look.dx = t.clientX - touchState.look.x;
+                touchState.look.dy = t.clientY - touchState.look.y;
+                touchState.look.x = t.clientX; touchState.look.y = t.clientY;
+            }
+        }
+    };
+    const onTouchEnd = (e) => {
+        for (const t of e.changedTouches) {
+            if (t.identifier === touchState.move.id) { touchState.move.id = -1; touchState.move.dx = 0; touchState.move.dy = 0; }
+            else if (t.identifier === touchState.look.id) { touchState.look.id = -1; touchState.look.dx = 0; touchState.look.dy = 0; }
+        }
+    };
+
+    window.addEventListener('touchstart', onTouchStart, {passive: false});
+    window.addEventListener('touchmove', onTouchMove, {passive: false});
+    window.addEventListener('touchend', onTouchEnd);
+}
+
+function animate() {
+    requestAnimationFrame(animate);
+    const dt = clock.getDelta();
+    
+    // --- 視点操作 ---
+    if (touchState.look.id !== -1) {
+        playerObj.rotation.y -= touchState.look.dx * CONFIG.turnSpeed;
+        camera.rotation.x = Math.max(-1.0, Math.min(1.0, camera.rotation.x - touchState.look.dy * CONFIG.turnSpeed));
+        touchState.look.dx = 0; touchState.look.dy = 0;
+    }
+
+    // --- 移動操作 ---
+    if (Math.abs(touchState.move.dy) > 0.05 || Math.abs(touchState.move.dx) > 0.05) {
+        const dir = new THREE.Vector3(0, 0, -1).applyAxisAngle(new THREE.Vector3(0,1,0), playerObj.rotation.y);
+        const side = new THREE.Vector3(1, 0, 0).applyAxisAngle(new THREE.Vector3(0,1,0), playerObj.rotation.y);
+        const moveStep = CONFIG.speed * dt;
+        
+        // 前後左右移動
+        playerObj.position.addScaledVector(dir, -touchState.move.dy * moveStep);
+        playerObj.position.addScaledVector(side, touchState.move.dx * moveStep);
+    }
+
+    // --- 地形衝突判定（簡易版）---
+    const groundH = getH(playerObj.position.x, playerObj.position.z);
+    const targetY = Math.max(groundH + 1.7, CONFIG.waterLevel + 1.7); // プレイヤーの目の高さ
+    
+    // 滑らかに高さを合わせる
+    playerObj.position.y = THREE.MathUtils.lerp(playerObj.position.y, targetY, 0.2);
+
+    renderer.render(scene, camera);
+}
+
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
